@@ -87,6 +87,12 @@ type OperatorStatus struct {
 	TVLETH          float64
 }
 
+type AttestationNonsigner struct {
+	BlobKey      string
+	QuorumNumber int
+	OperatorID   string // 0x-prefixed 64-char keccak256 hex
+}
+
 type AgedBlobKey struct {
 	BlobKey     string
 	RequestedAt uint64
@@ -261,6 +267,15 @@ CREATE TABLE IF NOT EXISTS eigenda.prober_health (
     uptime_seconds      BIGINT
 );
 
+CREATE TABLE IF NOT EXISTS eigenda.attestation_nonsigners (
+    snapshot_timestamp TIMESTAMPTZ DEFAULT NOW(),
+    blob_key           VARCHAR(128) NOT NULL,
+    quorum_number      INTEGER NOT NULL,
+    operator_id        VARCHAR(66) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_att_nonsigner_op   ON eigenda.attestation_nonsigners(operator_id, snapshot_timestamp);
+CREATE INDEX IF NOT EXISTS idx_att_nonsigner_blob ON eigenda.attestation_nonsigners(blob_key);
+
 CREATE OR REPLACE VIEW eigenda.account_usage AS
 SELECT
     account_id,
@@ -325,6 +340,15 @@ func (d *DB) InsertAttestation(ctx context.Context, a *AttestationSnapshot) erro
 		VALUES ($1, $2, $3, $4)`,
 		a.BlobKey, a.QuorumNumber,
 		a.TotalNonSigners, a.SigningStakePercentage,
+	)
+	return err
+}
+
+func (d *DB) InsertAttestationNonsigner(ctx context.Context, n *AttestationNonsigner) error {
+	_, err := d.conn.ExecContext(ctx, `
+		INSERT INTO eigenda.attestation_nonsigners (blob_key, quorum_number, operator_id)
+		VALUES ($1, $2, $3)`,
+		n.BlobKey, n.QuorumNumber, n.OperatorID,
 	)
 	return err
 }

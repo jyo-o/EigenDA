@@ -2,13 +2,16 @@ package worker
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"math/big"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/jyo-o/BONDA/eigenda/internal/dataapi"
 	"github.com/jyo-o/BONDA/eigenda/internal/db"
 	"github.com/jyo-o/BONDA/eigenda/internal/kzg"
@@ -146,12 +149,48 @@ func (v *RelayVerifier) fetchAttestation(ctx context.Context, blobKey string) {
 	if err != nil {
 		return
 	}
-	nonSignerCount := len(att.AttestationInfo.Attestation.NonSignerPubKeys)
+	nonSignerPubKeys := att.AttestationInfo.Attestation.NonSignerPubKeys
+	nonSignerCount := len(nonSignerPubKeys)
 	for qStr, signingPct := range att.AttestationInfo.Attestation.QuorumResults {
 		qNum, _ := strconv.Atoi(qStr)
 		v.db.InsertAttestation(ctx, &db.AttestationSnapshot{
 			BlobKey: blobKey, QuorumNumber: qNum,
 			TotalNonSigners: nonSignerCount, SigningStakePercentage: float64(signingPct),
 		})
+
+		// Record each non-signer's operator_id per quorum
+		for _, pk := range nonSignerPubKeys {
+			opID := pubkeyToOperatorID(pk)
+			if opID == "" {
+				continue
+			}
+			v.db.InsertAttestationNonsigner(ctx, &db.AttestationNonsigner{
+				BlobKey: blobKey, QuorumNumber: qNum, OperatorID: opID,
+			})
+		}
 	}
+}
+
+// pubkeyToOperatorID derives operator_id = keccak256(X || Y) from a BLS G1 pubkey.
+// X and Y are decimal-string big integers, each zero-padded to 32 bytes big-endian.
+func pubkeyToOperatorID(pk interface{}) string {
+	m, ok := pk.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	xStr, _ := m["X"].(string)
+	yStr, _ := m["Y"].(string)
+	if xStr == "" || yStr == "" {
+		return ""
+	}
+	x, ok1 := new(big.Int).SetString(xStr, 10)
+	y, ok2 := new(big.Int).SetString(yStr, 10)
+	if !ok1 || !ok2 {
+		return ""
+	}
+	buf := make([]byte, 64)
+	x.FillBytes(buf[:32])
+	y.FillBytes(buf[32:])
+	hash := crypto.Keccak256(buf)
+	return "0x" + hex.EncodeToString(hash)
 }

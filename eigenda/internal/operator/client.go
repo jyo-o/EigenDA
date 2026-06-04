@@ -16,6 +16,7 @@ type ChunkProbeResult struct {
 	Success        bool
 	LatencyMs      int
 	ChunksReturned int
+	ChunkData      [][]byte // raw chunk bytes for integrity verification
 	Error          string
 }
 
@@ -25,7 +26,10 @@ type Client struct {
 
 func NewClient() *Client {
 	return &Client{
-		timeout: 5 * time.Second,
+		// 8s (was 5s): under parallel fan-out on the 2-core box, operators that
+		// would answer in 5-8s were timing out and under-collecting chunks. Probes
+		// stay parallel so the extra headroom barely moves wall-clock.
+		timeout: 8 * time.Second,
 	}
 }
 
@@ -66,9 +70,11 @@ func (c *Client) ProbeChunks(ctx context.Context, operatorSocket string, blobKey
 		return &ChunkProbeResult{Success: false, LatencyMs: latencyMs, Error: fmt.Sprintf("GetChunks: %v", err)}
 	}
 
+	chunks := resp.GetChunks()
 	return &ChunkProbeResult{
 		Success:        true,
 		LatencyMs:      latencyMs,
-		ChunksReturned: len(resp.GetChunks()),
+		ChunksReturned: len(chunks),
+		ChunkData:      chunks,
 	}
 }

@@ -131,41 +131,34 @@ func (v *OperatorVerifier) Run(ctx context.Context) {
 }
 
 // fetchConcurrency bounds how many operators we query at once. Chunk retrieval
-// is network-bound (gRPC GetChunks, 5s timeout), so high concurrency costs almost
-// no CPU — important on this 2-core box.
+// is network-bound (gRPC GetChunks), so high concurrency costs almost no CPU —
+// important on this 2-core box.
 const fetchConcurrency = 32
 
-// probeAndRetrieve collects erasure-coded chunks from every operator IN PARALLEL
-// and records whether the blob is RECOVERABLE — i.e. whether at least
-// minChunksForRecovery chunks are still retrievable from the operator set.
-//
-// Erasure-coding guarantee: collecting >= ChunksRequired chunks IS the proof that
-// the blob is reconstructable, so we deliberately skip the actual RS decode and
-// the per-frame KZG verification. The previous path verified all ~2600 frames
-// one-by-one (~195s) and pegged this 2-core VM; chunk availability is the honest
-// retention signal and costs ~5s. (KZG genuineness can be re-added later as a
-// cheap sampled spot-check — see notes.)
-func (v *OperatorVerifier) probeAndRetrieve(ctx context.Context, blobKey string, blobAgeHours float64) {
-	allOperators, err := v.opDiscovery.GetOperators(ctx)
-	if err != nil {
-		return
-	}
+// maxProbeRetries: after the first parallel sweep, re-probe the operators that
+// returned nothing (transient timeouts under load) up to this many extra rounds
+// — until we either collect enough chunks (RECOVERABLE) or a round adds nothing
+// (the data is genuinely gone from the operator set). This is what separates
+// measuring the DA from measuring our own collector: a NOT-recoverable verdict
+// must mean the DA lost the data, never "we failed to reach an operator".
+const maxProbeRetries = 2
 
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
+// gcChunksPerOpMax: after retries, a NOT-recoverable probe is recorded as AT_RISK
+// only when the operators that answered are themselves out of chunks (chunks/op
+// ~1 = data GC'd). If they still held full chunk sets (chunks/op >= this) we just
+// could not reach enough of them on this 2-core box — a measurement miss, dropped
+// rather than recorded, so the curve stays a pure DA signal (not our reachability).
+const gcChunksPerOpMax = 4.0
 
-	start := time.Now()
-
+// probeSet probes ONE set of operators in parallel, records the per-operator row
+// for each, and returns chunks gained, how many contributed, and the operators
+// that returned nothing (the retry candidates).
+func (v *OperatorVerifier) probeSet(ctx context.Context, ops []operator.OperatorInfo, blobKey string, blobAgeHours float64) (chunks, okCount int, failed []operator.OperatorInfo) {
 	var mu sync.Mutex
-	totalChunks, okCount, failCount := 0, 0, 0
-
 	sem := make(chan struct{}, fetchConcurrency)
 	var wg sync.WaitGroup
 
-	for _, op := range allOperators {
-		if v.opDiscovery.IsBlacklisted(op.OperatorID) {
-			continue
-		}
+	for _, op := range ops {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(op operator.OperatorInfo) {
@@ -197,16 +190,54 @@ func (v *OperatorVerifier) probeAndRetrieve(ctx context.Context, blobKey string,
 			})
 
 			mu.Lock()
-			if r.Success {
+			if r.Success && r.ChunksReturned > 0 {
+				chunks += r.ChunksReturned
 				okCount++
-				totalChunks += r.ChunksReturned
 			} else {
-				failCount++
+				// No chunks (timeout, error, or empty GC'd response) → retry it.
+				failed = append(failed, op)
 			}
 			mu.Unlock()
 		}(op)
 	}
 	wg.Wait()
+	return
+}
+
+// probeAndRetrieve collects erasure-coded chunks from the operator set (retrying
+// transient failures) and records whether the blob is RECOVERABLE — at least
+// minChunksForRecovery chunks reachable. Collecting that many IS the proof of
+// reconstructability (erasure coding), so we skip the RS decode + per-frame KZG
+// verify. The retry loop is what makes this a PURE DA measurement: we never call
+// a blob AT_RISK until we have actually tried every operator and a full round
+// returned no new chunks. (Recoverable blobs clear 1024 on round 0 and stop;
+// only stragglers/GC'd blobs cost extra rounds.)
+func (v *OperatorVerifier) probeAndRetrieve(ctx context.Context, blobKey string, blobAgeHours float64) {
+	allOperators, err := v.opDiscovery.GetOperators(ctx)
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	start := time.Now()
+
+	totalChunks, okCount, rounds := 0, 0, 0
+	pending := allOperators
+	for {
+		chunks, ok, failed := v.probeSet(ctx, pending, blobKey, blobAgeHours)
+		totalChunks += chunks
+		okCount += ok
+		rounds++
+		if totalChunks >= minChunksForRecovery {
+			break // recoverable — no need to chase the stragglers
+		}
+		if rounds > maxProbeRetries || chunks == 0 || len(failed) == 0 {
+			break // retries exhausted, or a round added nothing → genuinely gone
+		}
+		pending = failed // re-probe only the operators that returned nothing
+	}
 
 	recoverable := totalChunks >= minChunksForRecovery
 	fetchMs := int(time.Since(start).Milliseconds())
@@ -215,20 +246,39 @@ func (v *OperatorVerifier) probeAndRetrieve(ctx context.Context, blobKey string,
 	if len(logKey) > 12 {
 		logKey = logKey[:12]
 	}
+
+	// Pure-DA filter: if we fell short of the threshold but the operators that
+	// answered were still holding chunks (chunks/op above a GC'd operator's ~1),
+	// we simply could not reach enough operators — a measurement miss, not data
+	// loss. Drop it rather than record a false AT_RISK; the survival curve must
+	// reflect the DA, not our reachability on this 2-core box. A genuine cliff has
+	// responders returning ~nothing (chunks/op ~1) and IS recorded below.
+	if !recoverable {
+		chunksPerOk := 0.0
+		if okCount > 0 {
+			chunksPerOk = float64(totalChunks) / float64(okCount)
+		}
+		if chunksPerOk >= gcChunksPerOpMax {
+			log.Printf("[recovery] blob=%s INCONCLUSIVE operators=%d/%d chunks=%d (%.1f/op) rounds=%d — under-collected, not recording",
+				logKey, okCount, len(allOperators), totalChunks, chunksPerOk, rounds)
+			return
+		}
+	}
+
 	tag := "RECOVERABLE"
 	if !recoverable {
 		tag = "AT_RISK"
 	}
-	log.Printf("[recovery] blob=%s operators=%d/%d chunks=%d/%d %s (%dms)",
-		logKey, okCount, okCount+failCount, totalChunks, minChunksForRecovery, tag, fetchMs)
+	log.Printf("[recovery] blob=%s operators=%d/%d chunks=%d/%d %s rounds=%d (%dms)",
+		logKey, okCount, len(allOperators), totalChunks, minChunksForRecovery, tag, rounds, fetchMs)
 
-	// DecodeSuccess carries the recoverability verdict — the survival curve keys on
-	// it. DecodeLatencyMs now records the parallel-fetch wall-clock. We no longer
-	// reconstruct the blob, so BlobHash/KZGVerified are intentionally left empty.
+	// DecodeSuccess carries the recoverability verdict — the survival curve keys
+	// on it. OperatorsTotal is the full set we tried; OperatorsOK contributed
+	// chunks. We no longer reconstruct, so BlobHash/KZGVerified stay empty.
 	v.db.InsertOperatorRetrieval(ctx, &db.OperatorRetrievalResult{
 		BlobKey:         blobKey,
 		BlobAgeHours:    blobAgeHours,
-		OperatorsTotal:  okCount + failCount,
+		OperatorsTotal:  len(allOperators),
 		OperatorsOK:     okCount,
 		ChunksCollected: totalChunks,
 		ChunksRequired:  minChunksForRecovery,

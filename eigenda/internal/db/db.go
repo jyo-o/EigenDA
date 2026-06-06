@@ -275,6 +275,11 @@ CREATE TABLE IF NOT EXISTS eigenda.attestation_nonsigners (
 );
 CREATE INDEX IF NOT EXISTS idx_att_nonsigner_op   ON eigenda.attestation_nonsigners(operator_id, snapshot_timestamp);
 CREATE INDEX IF NOT EXISTS idx_att_nonsigner_blob ON eigenda.attestation_nonsigners(blob_key);
+-- The bonda collector's incremental ETL reads new rows by time
+-- (WHERE snapshot_timestamp > watermark ORDER BY snapshot_timestamp LIMIT N).
+-- Neither index above leads with snapshot_timestamp, so that query seq-scans
+-- the full ~20M-row table every 30s cycle and trips the 30s statement_timeout.
+CREATE INDEX IF NOT EXISTS idx_att_nonsigner_ts   ON eigenda.attestation_nonsigners(snapshot_timestamp);
 
 CREATE OR REPLACE VIEW eigenda.account_usage AS
 SELECT

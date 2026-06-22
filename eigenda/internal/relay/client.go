@@ -54,6 +54,7 @@ func (c *Client) GetBlob(ctx context.Context, relayURL string, blobKeyHex string
 
 	conn, err := grpc.DialContext(ctx, relayURL,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(32*1024*1024)),
 	)
 	if err != nil {
 		return &RetrieveResult{
